@@ -1,0 +1,10 @@
+{
+  "name": "planner-app",
+  "version": "1.2.3",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  }
+}
