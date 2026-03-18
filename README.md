@@ -41,4 +41,4 @@ data/store.json
 
 ## Project Status
 
-Current working version: `@1.3`
+Current working version: `@1.3.1`

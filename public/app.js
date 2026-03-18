@@ -56,7 +56,7 @@ const BULK_ACTION_PRESETS = {
 };
 
 const defaultPreferences = {
-  versionLabel: "@1.3",
+  versionLabel: "@1.3.1",
   themeMode: "sand",
   behavior: {
     completedToArchive: false
@@ -87,6 +87,10 @@ function normalizeTask(task) {
     task.estimateMinutes !== undefined && task.estimateMinutes !== null && task.estimateMinutes !== ""
       ? Number(task.estimateMinutes) || ""
       : normalizeEstimateMinutes(task.estimateHours);
+  const manualEstimateMinutes =
+    task.manualEstimateMinutes !== undefined && task.manualEstimateMinutes !== null && task.manualEstimateMinutes !== ""
+      ? Number(task.manualEstimateMinutes) || ""
+      : estimateMinutes;
   return {
     id: task.id || uid("task"),
     title: task.title || "",
@@ -99,6 +103,7 @@ function normalizeTask(task) {
     status: task.status || "todo",
     previousStatus: task.previousStatus || "todo",
     deadline: task.deadline || "",
+    manualEstimateMinutes,
     estimateMinutes,
     trackedMs: Number(task.trackedMs || 0),
     activeStartedAt: task.activeStartedAt || "",
@@ -107,11 +112,13 @@ function normalizeTask(task) {
 }
 
 function normalizeState(raw) {
-  return {
+  const normalized = {
     projects: Array.isArray(raw?.projects) ? raw.projects : [],
     tags: Array.isArray(raw?.tags) ? raw.tags : [],
     tasks: Array.isArray(raw?.tasks) ? raw.tasks.map(normalizeTask) : []
   };
+  recomputeDerivedEstimates(normalized.tasks);
+  return normalized;
 }
 
 function escapeHtml(value) {
@@ -254,6 +261,7 @@ function undoLastAction() {
   }
 
   state = normalizeState(JSON.parse(snapshot));
+  refreshDerivedTaskState();
   scheduleSave();
   renderAll();
 }
@@ -284,6 +292,45 @@ function sortTasks(tasks) {
 
 function sortTasksForDisplay(tasks) {
   return [...tasks].sort(compareTasks);
+}
+
+function recomputeDerivedEstimates(tasks) {
+  const visited = new Set();
+
+  function compute(task) {
+    if (!task || visited.has(task.id)) {
+      return Number(task?.estimateMinutes || 0);
+    }
+
+    const children = tasks.filter((item) => (item.parentId || null) === task.id);
+    if (!children.length) {
+      task.estimateMinutes = task.status === "done" ? "" : task.manualEstimateMinutes || "";
+      visited.add(task.id);
+      return Number(task.estimateMinutes || 0);
+    }
+
+    children.forEach(compute);
+    const openChildren = children.filter((child) => child.status !== "done");
+
+    if (!openChildren.length) {
+      task.estimateMinutes = "";
+      visited.add(task.id);
+      return 0;
+    }
+
+    const allOpenChildrenEstimated = openChildren.every((child) => Number(child.estimateMinutes || 0) > 0);
+    task.estimateMinutes = allOpenChildrenEstimated
+      ? openChildren.reduce((sum, child) => sum + Number(child.estimateMinutes || 0), 0)
+      : task.manualEstimateMinutes || "";
+    visited.add(task.id);
+    return Number(task.estimateMinutes || 0);
+  }
+
+  tasks.forEach(compute);
+}
+
+function refreshDerivedTaskState() {
+  recomputeDerivedEstimates(state.tasks);
 }
 
 function normalizeEstimateMinutes(value) {
@@ -379,6 +426,25 @@ function getTrackedMs(task) {
   return stored + Math.max(0, Date.now() - startedAt);
 }
 
+function getPlannedBaselineEstimate(task, tasks = state.tasks) {
+  if (!task) {
+    return 0;
+  }
+
+  const children = tasks.filter((item) => (item.parentId || null) === task.id);
+  if (!children.length) {
+    return Number(task.manualEstimateMinutes || task.estimateMinutes || 0);
+  }
+
+  const childBaselines = children.map((child) => getPlannedBaselineEstimate(child, tasks));
+  const allChildrenEstimated = childBaselines.every((value) => value > 0);
+  if (allChildrenEstimated) {
+    return childBaselines.reduce((sum, value) => sum + value, 0);
+  }
+
+  return Number(task.manualEstimateMinutes || task.estimateMinutes || 0);
+}
+
 function formatTimer(ms) {
   const totalSeconds = Math.max(0, Math.floor(Number(ms || 0) / 1000));
   const hours = Math.floor(totalSeconds / 3600);
@@ -393,7 +459,7 @@ function formatTrackedDuration(ms) {
 }
 
 function getEstimateDeltaMinutes(task) {
-  return Math.round(getTrackedMs(task) / 60000) - Number(task.estimateMinutes || 0);
+  return Math.round(getTrackedMs(task) / 60000) - getPlannedBaselineEstimate(task);
 }
 
 function getDeadlineWeight(task) {
@@ -759,7 +825,7 @@ function parseInlineTaskText(text, task) {
     title: extracted.title,
     deadline: extracted.deadline || task.deadline || "",
     priority: extracted.priority || task.priority || "",
-    estimateMinutes: extracted.estimateMinutes || task.estimateMinutes || "",
+    estimateMinutes: extracted.estimateMinutes || task.manualEstimateMinutes || task.estimateMinutes || "",
     tagIds: [...tagIds]
   };
 }
@@ -880,7 +946,29 @@ function scheduleGhostPreview(targetId, text) {
 }
 
 function getTotalEstimate(tasks) {
-  return tasks.reduce((sum, task) => sum + Number(task.estimateMinutes || 0), 0);
+  const taskIds = new Set(tasks.map((task) => task.id));
+
+  function getChildrenFromPool(parentId) {
+    return tasks.filter((task) => (task.parentId || null) === parentId);
+  }
+
+  function getBranchEstimate(task) {
+    const children = getChildrenFromPool(task.id);
+    if (!children.length) {
+      return Number(task.estimateMinutes || 0);
+    }
+
+    const allChildrenEstimated = children.every((child) => Number(child.estimateMinutes || 0) > 0);
+    if (allChildrenEstimated) {
+      return children.reduce((sum, child) => sum + getBranchEstimate(child), 0);
+    }
+
+    return Number(task.manualEstimateMinutes || task.estimateMinutes || 0);
+  }
+
+  return tasks
+    .filter((task) => !task.parentId || !taskIds.has(task.parentId))
+    .reduce((sum, task) => sum + getBranchEstimate(task), 0);
 }
 
 function getOpenTasks(tasks) {
@@ -892,6 +980,7 @@ function getPriorityWeight(priority) {
 }
 
 function scheduleSave() {
+  refreshDerivedTaskState();
   ui.saveState = "saving";
   renderSidebar();
 
@@ -931,6 +1020,7 @@ async function loadState() {
     }
 
     state = normalizeState(await response.json());
+    refreshDerivedTaskState();
     ui.saveState = "saved";
   } catch (error) {
     console.error(error);
@@ -1044,6 +1134,7 @@ function createTaskAtEnd(rawTitle = "") {
   task.title = parsed.title;
   task.deadline = parsed.deadline;
   task.priority = parsed.priority;
+  task.manualEstimateMinutes = parsed.estimateMinutes;
   task.estimateMinutes = parsed.estimateMinutes;
   task.tagIds = parsed.tagIds;
 
@@ -1077,6 +1168,7 @@ function createTaskAfter(taskId, initialTitle = "") {
   task.title = parsed.title;
   task.deadline = parsed.deadline;
   task.priority = parsed.priority;
+  task.manualEstimateMinutes = parsed.estimateMinutes;
   task.estimateMinutes = parsed.estimateMinutes;
   task.tagIds = parsed.tagIds;
 
@@ -1109,6 +1201,7 @@ function createChildTask(parentId, initialTitle = "") {
   task.title = parsed.title;
   task.deadline = parsed.deadline;
   task.priority = parsed.priority;
+  task.manualEstimateMinutes = parsed.estimateMinutes;
   task.estimateMinutes = parsed.estimateMinutes;
   task.tagIds = parsed.tagIds;
 
@@ -1297,6 +1390,7 @@ function applyTaskInput(taskId, inputValue) {
     title: parsed.title || (hasChildren ? task.title || "Untitled" : ""),
     deadline: parsed.deadline,
     priority: parsed.priority,
+    manualEstimateMinutes: parsed.estimateMinutes,
     estimateMinutes: parsed.estimateMinutes,
     tagIds: parsed.tagIds
   });
@@ -1492,6 +1586,7 @@ function clearTaskMeta(taskId, type, value = "") {
   }
 
   if (type === "estimate") {
+    task.manualEstimateMinutes = "";
     task.estimateMinutes = "";
   }
 
@@ -2332,6 +2427,7 @@ function renderKanbanCard(task) {
     task.status === "active"
       ? `<strong class="kanban-timer" data-live-timer-task="${escapeHtml(task.id)}">${escapeHtml(formatTimer(trackedMs))}</strong>`
       : `<strong class="kanban-timer static">${escapeHtml(formatTrackedDuration(trackedMs))}</strong>`;
+  const baselineEstimate = getPlannedBaselineEstimate(task);
 
   return `
     <article
@@ -2343,7 +2439,7 @@ function renderKanbanCard(task) {
     >
       <div class="kanban-card-top">
         <span class="status-chip ${getStatusTone(task.status)}">${escapeHtml(getStatusLabel(task.status))}</span>
-        ${task.estimateMinutes ? `<span class="kanban-pill">${escapeHtml(formatEstimate(task.estimateMinutes))}</span>` : ""}
+        ${baselineEstimate ? `<span class="kanban-pill">${escapeHtml(formatEstimate(baselineEstimate))}</span>` : ""}
       </div>
       <h3>${escapeHtml(task.title || "Untitled task")}</h3>
       ${
@@ -2360,7 +2456,7 @@ function renderKanbanCard(task) {
         ${actualLabel}
       </div>
       ${
-        task.estimateMinutes
+        baselineEstimate
           ? `
             <div class="kanban-delta-row ${getEstimateDeltaMinutes(task) > 0 ? "over" : getEstimateDeltaMinutes(task) < 0 ? "under" : "balanced"}">
               <span>Delta</span>
@@ -2425,6 +2521,8 @@ function renderStatusView() {
   const openTasks = getOpenTasks(state.tasks);
   const doneTasks = state.tasks.filter((task) => task.status === "done");
   const activeTask = state.tasks.find((task) => task.status === "active") || null;
+  const totalTrackedMs = state.tasks.reduce((sum, task) => sum + getTrackedMs(task), 0);
+  const totalPlannedOpen = getTotalEstimate(openTasks);
   const quickTasks = openTasks
     .filter((task) => matchesSmartScope(task, "quick15"))
     .sort(compareTasks);
@@ -2445,13 +2543,14 @@ function renderStatusView() {
       return {
         name: tag.name,
         total: tasks.length,
-        planned: tasks.reduce((sum, task) => sum + Number(task.estimateMinutes || 0), 0),
+        planned: getTotalEstimate(tasks),
         actualMs: tasks.reduce((sum, task) => sum + getTrackedMs(task), 0)
       };
     })
     .filter((tag) => tag.total > 0);
   const executionStats = [...state.tasks]
-    .filter((task) => Number(task.estimateMinutes || 0) || Number(task.trackedMs || 0) || task.status === "active")
+    .filter((task) => task.status === "done")
+    .filter((task) => getPlannedBaselineEstimate(task) > 0 || getTrackedMs(task) > 0)
     .sort((a, b) => Math.abs(getEstimateDeltaMinutes(b)) - Math.abs(getEstimateDeltaMinutes(a)))
     .slice(0, 10);
 
@@ -2461,7 +2560,7 @@ function renderStatusView() {
         <article class="status-card">
           <span>Open tasks</span>
           <strong>${openTasks.length}</strong>
-          <p>${escapeHtml(formatEstimate(getTotalEstimate(openTasks)) || "0m")} planned</p>
+          <p>${escapeHtml(formatEstimate(totalPlannedOpen) || "0m")} left to do</p>
         </article>
         <article class="status-card">
           <span>Closed tasks</span>
@@ -2469,14 +2568,14 @@ function renderStatusView() {
           <p>${state.tasks.length ? Math.round((doneTasks.length / state.tasks.length) * 100) : 0}% complete</p>
         </article>
         <article class="status-card">
-          <span>Active now</span>
-          <strong>${activeTask ? "1" : "0"}</strong>
-          <p>${activeTask ? escapeHtml(activeTask.title || "Untitled task") : "No task in focus"}</p>
+          <span>Planned work</span>
+          <strong>${escapeHtml(formatEstimate(getTotalEstimate(state.tasks)) || "0m")}</strong>
+          <p>Total estimated workload across the current tree.</p>
         </article>
         <article class="status-card">
-          <span>Known tags</span>
-          <strong>${state.tags.length}</strong>
-          <p>Auto-created from inline writing</p>
+          <span>Tracked actual</span>
+          <strong>${escapeHtml(formatTrackedDuration(totalTrackedMs))}</strong>
+          <p>${activeTask ? `Active: ${escapeHtml(activeTask.title || "Untitled task")}` : "No task in focus"}</p>
         </article>
       </div>
 
@@ -2484,7 +2583,7 @@ function renderStatusView() {
         <section class="status-panel">
           <div class="section-heading">
             <h2>By project</h2>
-            <p>How much is open and how much time is still visible there.</p>
+            <p>How much work is still left inside each project.</p>
           </div>
           <div class="status-list">
             ${
@@ -2571,7 +2670,7 @@ function renderStatusView() {
                       return `
                         <div class="status-row">
                           <strong>${escapeHtml(task.title || "Untitled task")}</strong>
-                          <span>${escapeHtml(formatEstimate(task.estimateMinutes) || "0m")} planned</span>
+                          <span>${escapeHtml(formatEstimate(getPlannedBaselineEstimate(task)) || "0m")} planned</span>
                           <span>${escapeHtml(formatTrackedDuration(getTrackedMs(task)))} actual</span>
                           <span>${delta === 0 ? "on plan" : `${escapeHtml(formatEstimate(Math.abs(delta)) || "0m")} ${delta > 0 ? "over" : "under"}`}</span>
                         </div>
