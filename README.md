@@ -1,6 +1,6 @@
 # PlannerApp
 
-Personal local-first planner with nested tasks, inline metadata, smart views, and a lightweight mind map.
+Personal local-first planner with nested tasks, inline metadata, smart views, a Kanban focus mode, and a lightweight mind map.
 
 Built as a personal tool in an AI-assisted vibe-coding workflow with ChatGPT-style reasoning and iterative UI/UX polishing.
 
@@ -10,6 +10,8 @@ Built as a personal tool in an AI-assisted vibe-coding workflow with ChatGPT-sty
 - organize work by projects and tags
 - write metadata inline: `#tag`, `18/06`, `P1`, `~1:30`
 - sort tasks by deadline, priority, and time estimate
+- move work through `To do / Active / Hold / Complete` in Kanban
+- track actual time spent on the active task and compare it with the estimate
 - switch between list planning and `Paths / Tree / Timeline` mind-map views
 - use the built-in `Quick 15m` smart list for short tasks
 - bulk-edit multiple tasks
@@ -39,4 +41,4 @@ data/store.json
 
 ## Project Status
 
-Current working version: `@1.2.3`
+Current working version: `@1.3`

@@ -56,7 +56,7 @@ const BULK_ACTION_PRESETS = {
 };
 
 const defaultPreferences = {
-  versionLabel: "@1.2.3",
+  versionLabel: "@1.3",
   themeMode: "sand",
   behavior: {
     completedToArchive: false
@@ -97,8 +97,11 @@ function normalizeTask(task) {
     order: Number(task.order || 1),
     priority: task.priority || "",
     status: task.status || "todo",
+    previousStatus: task.previousStatus || "todo",
     deadline: task.deadline || "",
     estimateMinutes,
+    trackedMs: Number(task.trackedMs || 0),
+    activeStartedAt: task.activeStartedAt || "",
     createdAt: task.createdAt || new Date().toISOString()
   };
 }
@@ -304,6 +307,38 @@ function normalizeEstimateMinutes(value) {
   return Math.round(numeric * 60);
 }
 
+function getStatusLabel(status) {
+  if (status === "active") {
+    return "Active";
+  }
+
+  if (status === "hold") {
+    return "Hold";
+  }
+
+  if (status === "done") {
+    return "Done";
+  }
+
+  return "To do";
+}
+
+function getStatusTone(status) {
+  if (status === "active") {
+    return "active";
+  }
+
+  if (status === "hold") {
+    return "hold";
+  }
+
+  if (status === "done") {
+    return "done";
+  }
+
+  return "todo";
+}
+
 function parseEstimateMinutes(rawValue) {
   const source = String(rawValue || "").trim();
   if (!source) {
@@ -328,6 +363,37 @@ function parseEstimateMinutes(rawValue) {
 
 function getEstimateWeight(task) {
   return Number(task.estimateMinutes || 0);
+}
+
+function getTrackedMs(task) {
+  const stored = Number(task.trackedMs || 0);
+  if (task.status !== "active" || !task.activeStartedAt) {
+    return stored;
+  }
+
+  const startedAt = new Date(task.activeStartedAt).getTime();
+  if (!Number.isFinite(startedAt)) {
+    return stored;
+  }
+
+  return stored + Math.max(0, Date.now() - startedAt);
+}
+
+function formatTimer(ms) {
+  const totalSeconds = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return [hours, minutes, seconds].map((value) => String(value).padStart(2, "0")).join(":");
+}
+
+function formatTrackedDuration(ms) {
+  const totalMinutes = Math.max(0, Math.round(Number(ms || 0) / 60000));
+  return formatEstimate(totalMinutes) || "0m";
+}
+
+function getEstimateDeltaMinutes(task) {
+  return Math.round(getTrackedMs(task) / 60000) - Number(task.estimateMinutes || 0);
 }
 
 function getDeadlineWeight(task) {
@@ -1138,6 +1204,81 @@ function updateTask(taskId, patch) {
   renderAll();
 }
 
+function stopActiveTimer(task) {
+  if (!task || task.status !== "active" || !task.activeStartedAt) {
+    return;
+  }
+
+  const startedAt = new Date(task.activeStartedAt).getTime();
+  if (!Number.isFinite(startedAt)) {
+    task.activeStartedAt = "";
+    return;
+  }
+
+  task.trackedMs = Number(task.trackedMs || 0) + Math.max(0, Date.now() - startedAt);
+  task.activeStartedAt = "";
+}
+
+function setTaskStatus(taskId, nextStatus) {
+  const task = getTask(taskId);
+  if (!task || !nextStatus) {
+    return;
+  }
+
+  const normalizedNextStatus = nextStatus === "inactive" ? task.previousStatus || "todo" : nextStatus;
+  if (task.status === normalizedNextStatus) {
+    return;
+  }
+
+  rememberHistory();
+
+  if (normalizedNextStatus === "active") {
+    state.tasks.forEach((item) => {
+      if (item.id !== task.id && item.status === "active") {
+        stopActiveTimer(item);
+        item.previousStatus = item.previousStatus || "todo";
+        item.status = "hold";
+      }
+    });
+
+    task.previousStatus =
+      task.status === "active" ? task.previousStatus || "todo" : task.status === "done" ? "todo" : task.status || "todo";
+    task.status = "active";
+    task.activeStartedAt = new Date().toISOString();
+  } else {
+    stopActiveTimer(task);
+    task.status = normalizedNextStatus;
+    if (normalizedNextStatus !== "done") {
+      task.previousStatus = normalizedNextStatus === "hold" ? "todo" : task.previousStatus || "todo";
+    }
+  }
+
+  if (normalizedNextStatus === "done") {
+    task.previousStatus = "todo";
+  }
+
+  if (preferences.behavior.completedToArchive && normalizedNextStatus === "done") {
+    ui.completedOnly = false;
+  }
+
+  scheduleSave();
+  renderAll();
+}
+
+function toggleActiveTask(taskId) {
+  const task = getTask(taskId);
+  if (!task || task.status === "done") {
+    return;
+  }
+
+  if (task.status === "active") {
+    setTaskStatus(task.id, task.previousStatus || "todo");
+    return;
+  }
+
+  setTaskStatus(task.id, "active");
+}
+
 function applyTaskInput(taskId, inputValue) {
   const task = getTask(taskId);
   if (!task) {
@@ -1282,15 +1423,7 @@ function toggleTaskDone(taskId) {
     return;
   }
 
-  rememberHistory();
-  task.status = task.status === "done" ? "todo" : "done";
-
-  if (preferences.behavior.completedToArchive && task.status === "done") {
-    ui.completedOnly = false;
-  }
-
-  scheduleSave();
-  renderAll();
+  setTaskStatus(taskId, task.status === "done" ? "todo" : "done");
 }
 
 function indentTask(taskId) {
@@ -1401,6 +1534,7 @@ function renderSidebar() {
         <section class="nav-group">
         <div class="view-switch">
           <button class="view-button ${ui.view === "tasks" ? "active" : ""}" data-view="tasks">Tasks</button>
+          <button class="view-button ${ui.view === "kanban" ? "active" : ""}" data-view="kanban">Kanban</button>
           <button class="view-button ${ui.view === "map" ? "active" : ""}" data-view="map">MindMap</button>
           <button class="view-button ${ui.view === "status" ? "active" : ""}" data-view="status">Status</button>
         </div>
@@ -1684,6 +1818,10 @@ function renderTaskRow(row) {
   const meta = [];
   const metaTaskId = task.id;
 
+  if (task.status === "active" || task.status === "hold") {
+    meta.push(`<span class="meta-chip status-chip ${getStatusTone(task.status)}">${escapeHtml(getStatusLabel(task.status))}</span>`);
+  }
+
   if (task.deadline) {
     meta.push(`
       <button class="meta-chip" data-clear-meta="deadline" data-task-id="${escapeHtml(task.id)}">
@@ -1725,7 +1863,7 @@ function renderTaskRow(row) {
   const isSelected = ui.taskSelection.has(task.id);
 
   return `
-    <div class="task-row depth-${Math.min(depth, 6)} ${task.status === "done" ? "done" : ""} ${isSelected ? "selected" : ""}">
+    <div class="task-row depth-${Math.min(depth, 6)} ${task.status === "done" ? "done" : ""} ${task.status === "active" ? "active" : ""} ${task.status === "hold" ? "hold" : ""} ${isSelected ? "selected" : ""}">
       <button class="select-button ${isSelected ? "selected" : ""}" data-select-task="${escapeHtml(task.id)}" aria-label="Select task"></button>
       <button class="check-button ${task.status === "done" ? "checked" : ""}" data-toggle-done="${escapeHtml(task.id)}" aria-label="Toggle done"></button>
       <div class="task-body">
@@ -1963,6 +2101,7 @@ function renderMapMeta(task) {
 
   return `
     <div class="map-meta">
+      ${task.status === "active" || task.status === "hold" ? `<span class="status-chip ${getStatusTone(task.status)}">${escapeHtml(getStatusLabel(task.status))}</span>` : ""}
       ${task.deadline ? `<span>${escapeHtml(formatDate(task.deadline))}</span>` : ""}
       ${priorityLabel ? `<span>${escapeHtml(priorityLabel)}</span>` : ""}
       ${task.estimateMinutes ? `<span>${escapeHtml(formatEstimate(task.estimateMinutes))}</span>` : ""}
@@ -2184,9 +2323,108 @@ function renderMapView(visibleIds) {
   `;
 }
 
+function renderKanbanCard(task) {
+  const tags = task.tagIds.map(getTag).filter(Boolean);
+  const parent = task.parentId ? getTask(task.parentId) : null;
+  const project = getProject(task.projectId);
+  const trackedMs = getTrackedMs(task);
+  const actualLabel =
+    task.status === "active"
+      ? `<strong class="kanban-timer" data-live-timer-task="${escapeHtml(task.id)}">${escapeHtml(formatTimer(trackedMs))}</strong>`
+      : `<strong class="kanban-timer static">${escapeHtml(formatTrackedDuration(trackedMs))}</strong>`;
+
+  return `
+    <article
+      class="kanban-card ${task.status === "active" ? "active" : ""} ${task.status === "hold" ? "hold" : ""} ${task.status === "done" ? "done" : ""}"
+      style="--project-tone:${escapeHtml(getProjectTone(project))};"
+      draggable="true"
+      data-kanban-task="${escapeHtml(task.id)}"
+      ${task.status !== "done" ? `data-kanban-toggle-active="${escapeHtml(task.id)}"` : ""}
+    >
+      <div class="kanban-card-top">
+        <span class="status-chip ${getStatusTone(task.status)}">${escapeHtml(getStatusLabel(task.status))}</span>
+        ${task.estimateMinutes ? `<span class="kanban-pill">${escapeHtml(formatEstimate(task.estimateMinutes))}</span>` : ""}
+      </div>
+      <h3>${escapeHtml(task.title || "Untitled task")}</h3>
+      ${
+        (ui.selectedTagId !== "all" || ui.completedOnly || ui.smartScope !== "none") && parent
+          ? `<div class="task-context-line">From <span>${escapeHtml(parent.title || "Untitled task")}</span></div>`
+          : ""
+      }
+      <div class="kanban-meta">
+        ${task.deadline ? `<span class="kanban-pill">${escapeHtml(formatDate(task.deadline))}</span>` : ""}
+        ${tags.map((tag) => `<span class="kanban-pill">#${escapeHtml(tag.name)}</span>`).join("")}
+      </div>
+      <div class="kanban-timer-row">
+        <span>Actual</span>
+        ${actualLabel}
+      </div>
+      ${
+        task.estimateMinutes
+          ? `
+            <div class="kanban-delta-row ${getEstimateDeltaMinutes(task) > 0 ? "over" : getEstimateDeltaMinutes(task) < 0 ? "under" : "balanced"}">
+              <span>Delta</span>
+              <strong>${escapeHtml(formatEstimate(Math.abs(getEstimateDeltaMinutes(task))) || "0m")}${getEstimateDeltaMinutes(task) > 0 ? " over" : getEstimateDeltaMinutes(task) < 0 ? " under" : ""}</strong>
+            </div>
+          `
+          : ""
+      }
+    </article>
+  `;
+}
+
+function renderKanbanView(visibleIds) {
+  const columns = [
+    { key: "todo", title: "To do", note: "Ready to pick up." },
+    { key: "active", title: "Active", note: "Only one task runs the timer." },
+    { key: "hold", title: "Hold", note: "Paused without losing tracked time." },
+    { key: "done", title: "Complete", note: "Finished work." }
+  ];
+
+  return `
+    <section class="canvas-shell">
+      <div class="canvas-topbar">
+        <div>
+          <h2>${escapeHtml(getCurrentScopeLabel())}</h2>
+          <p>Click a card to make it active. Click the active card again to send it back. Drag between columns when you want to move it manually.</p>
+        </div>
+        <div class="canvas-controls">
+          <input id="search-input" class="search-input" value="${escapeHtml(ui.search)}" placeholder="Search tasks, tags, projects" />
+        </div>
+      </div>
+
+      <div class="kanban-board">
+        ${columns
+          .map((column) => {
+            const columnTasks = state.tasks
+              .filter((task) => visibleIds.has(task.id) && task.status === column.key)
+              .sort(compareTasks);
+
+            return `
+              <section class="kanban-column" data-kanban-drop="${column.key}">
+                <div class="kanban-column-head">
+                  <div>
+                    <h3>${escapeHtml(column.title)}</h3>
+                    <p>${escapeHtml(column.note)}</p>
+                  </div>
+                  <strong>${columnTasks.length}</strong>
+                </div>
+                <div class="kanban-column-body">
+                  ${columnTasks.length ? columnTasks.map(renderKanbanCard).join("") : '<div class="kanban-empty">No tasks</div>'}
+                </div>
+              </section>
+            `;
+          })
+          .join("")}
+      </div>
+    </section>
+  `;
+}
+
 function renderStatusView() {
   const openTasks = getOpenTasks(state.tasks);
   const doneTasks = state.tasks.filter((task) => task.status === "done");
+  const activeTask = state.tasks.find((task) => task.status === "active") || null;
   const quickTasks = openTasks
     .filter((task) => matchesSmartScope(task, "quick15"))
     .sort(compareTasks);
@@ -2207,10 +2445,15 @@ function renderStatusView() {
       return {
         name: tag.name,
         total: tasks.length,
-        priority: tasks.reduce((max, task) => Math.max(max, getPriorityWeight(task.priority)), 0)
+        planned: tasks.reduce((sum, task) => sum + Number(task.estimateMinutes || 0), 0),
+        actualMs: tasks.reduce((sum, task) => sum + getTrackedMs(task), 0)
       };
     })
     .filter((tag) => tag.total > 0);
+  const executionStats = [...state.tasks]
+    .filter((task) => Number(task.estimateMinutes || 0) || Number(task.trackedMs || 0) || task.status === "active")
+    .sort((a, b) => Math.abs(getEstimateDeltaMinutes(b)) - Math.abs(getEstimateDeltaMinutes(a)))
+    .slice(0, 10);
 
   return `
     <section class="canvas-shell">
@@ -2224,6 +2467,11 @@ function renderStatusView() {
           <span>Closed tasks</span>
           <strong>${doneTasks.length}</strong>
           <p>${state.tasks.length ? Math.round((doneTasks.length / state.tasks.length) * 100) : 0}% complete</p>
+        </article>
+        <article class="status-card">
+          <span>Active now</span>
+          <strong>${activeTask ? "1" : "0"}</strong>
+          <p>${activeTask ? escapeHtml(activeTask.title || "Untitled task") : "No task in focus"}</p>
         </article>
         <article class="status-card">
           <span>Known tags</span>
@@ -2261,7 +2509,7 @@ function renderStatusView() {
         <section class="status-panel">
           <div class="section-heading">
             <h2>By tag</h2>
-            <p>Tag load at a glance.</p>
+            <p>Planned vs actual by tag.</p>
           </div>
           <div class="status-list">
             ${
@@ -2272,7 +2520,8 @@ function renderStatusView() {
                         <div class="status-row">
                           <strong>#${escapeHtml(item.name)}</strong>
                           <span>${item.total} tasks</span>
-                          <span>${item.priority ? `top ${item.priority}` : "no priority"}</span>
+                          <span>${escapeHtml(formatEstimate(item.planned) || "0m")} planned</span>
+                          <span>${escapeHtml(formatTrackedDuration(item.actualMs))} actual</span>
                         </div>
                       `
                     )
@@ -2304,6 +2553,32 @@ function renderStatusView() {
                     })
                     .join("")
                 : '<div class="empty-paper">No quick tasks yet.</div>'
+            }
+          </div>
+        </section>
+
+        <section class="status-panel">
+          <div class="section-heading">
+            <h2>Plan vs actual</h2>
+            <p>Where execution drifted from the estimate.</p>
+          </div>
+          <div class="status-list">
+            ${
+              executionStats.length
+                ? executionStats
+                    .map((task) => {
+                      const delta = getEstimateDeltaMinutes(task);
+                      return `
+                        <div class="status-row">
+                          <strong>${escapeHtml(task.title || "Untitled task")}</strong>
+                          <span>${escapeHtml(formatEstimate(task.estimateMinutes) || "0m")} planned</span>
+                          <span>${escapeHtml(formatTrackedDuration(getTrackedMs(task)))} actual</span>
+                          <span>${delta === 0 ? "on plan" : `${escapeHtml(formatEstimate(Math.abs(delta)) || "0m")} ${delta > 0 ? "over" : "under"}`}</span>
+                        </div>
+                      `;
+                    })
+                    .join("")
+                : '<div class="empty-paper">Tracked work will appear here once you start using Active.</div>'
             }
           </div>
         </section>
@@ -2683,12 +2958,92 @@ function bindMapInteractions() {
   });
 }
 
+function bindKanbanInteractions() {
+  elements.main.querySelector("#search-input")?.addEventListener("input", (event) => {
+    ui.search = event.currentTarget.value;
+    renderMain();
+  });
+
+  elements.main.querySelectorAll("[data-kanban-toggle-active]").forEach((card) => {
+    card.addEventListener("click", (event) => {
+      const taskId = card.getAttribute("data-kanban-toggle-active");
+      if (!taskId) {
+        return;
+      }
+
+      if (event.target instanceof HTMLElement && event.target.closest("[draggable='true']")) {
+        toggleActiveTask(taskId);
+      }
+    });
+  });
+
+  elements.main.querySelectorAll("[data-kanban-task]").forEach((card) => {
+    card.addEventListener("dragstart", () => {
+      ui.dragTaskId = card.getAttribute("data-kanban-task");
+      card.classList.add("dragging");
+    });
+
+    card.addEventListener("dragend", () => {
+      ui.dragTaskId = null;
+      card.classList.remove("dragging");
+    });
+  });
+
+  elements.main.querySelectorAll("[data-kanban-drop]").forEach((column) => {
+    column.addEventListener("dragover", (event) => {
+      if (!ui.dragTaskId) {
+        return;
+      }
+
+      event.preventDefault();
+      column.classList.add("drag-over");
+    });
+
+    column.addEventListener("dragleave", () => {
+      column.classList.remove("drag-over");
+    });
+
+    column.addEventListener("drop", (event) => {
+      event.preventDefault();
+      column.classList.remove("drag-over");
+      const nextStatus = column.getAttribute("data-kanban-drop");
+      if (ui.dragTaskId && nextStatus) {
+        setTaskStatus(ui.dragTaskId, nextStatus);
+      }
+      ui.dragTaskId = null;
+    });
+  });
+}
+
+function syncLiveTimers() {
+  document.querySelectorAll("[data-live-timer-task]").forEach((element) => {
+    const taskId = element.getAttribute("data-live-timer-task");
+    const task = getTask(taskId);
+    if (!task) {
+      return;
+    }
+
+    element.textContent = formatTimer(getTrackedMs(task));
+  });
+}
+
+window.setInterval(() => {
+  if (!state.tasks.some((task) => task.status === "active")) {
+    return;
+  }
+
+  syncLiveTimers();
+}, 1000);
+
 function renderMain() {
   const visibleIds = getVisibleTaskIds();
 
   if (ui.view === "map") {
     elements.main.innerHTML = renderMapView(visibleIds);
     bindMapInteractions();
+  } else if (ui.view === "kanban") {
+    elements.main.innerHTML = renderKanbanView(visibleIds);
+    bindKanbanInteractions();
   } else if (ui.view === "status") {
     elements.main.innerHTML = renderStatusView();
   } else {
@@ -2696,6 +3051,7 @@ function renderMain() {
     bindTaskInteractions();
   }
 
+  syncLiveTimers();
   applyPendingFocus();
 }
 
